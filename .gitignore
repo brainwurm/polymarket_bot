@@ -1,0 +1,27 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+env/
+*.egg-info/
+
+# Database
+*.db
+*.sqlite3
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Node / dashboard
+dashboard/node_modules/
+dashboard/dist/
+dashboard/dist-ssr/
