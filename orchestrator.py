@@ -1,6 +1,3 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 """
 orchestrator.py  —  Polymarket Multi-Agent Trading Orchestrator
 ===============================================================
@@ -52,6 +49,13 @@ except ImportError:
     BINANCE_AVAILABLE = False
     log_placeholder = logging.getLogger("orchestrator")
     log_placeholder.warning("binance_data not available — install numpy pandas to enable crypto-edge agent")
+
+# ── Lazy import of weather_edge (graceful fallback) ──────────────────────────
+try:
+    from weather_edge import get_weather_signals, match_weather_market
+    WEATHER_AVAILABLE = True
+except ImportError:
+    WEATHER_AVAILABLE = False
 
 # ── Lazy import of py-clob-client so the file is still useful without it ──
 try:
@@ -245,6 +249,8 @@ CATEGORY_KEYWORDS = {
     ],
     "niche_news": [
         "weather", "hurricane", "earthquake", "flood", "storm",
+        "temperature", "fahrenheit", "celsius", "rain", "snow",
+        "dallas", "atlanta", "seoul", "shanghai", "phoenix", "kansas city",
         "science", "nasa", "spaceflight", "rocket", "launch",
         "sports", "nba", "nfl", "nhl", "mlb", "soccer", "fifa",
         "oscars", "grammy", "emmy", "award", "celebrity",
@@ -518,7 +524,79 @@ async def crypto_edge_agent(markets: list[dict]) -> list[Signal]:
     log.info(f"[crypto-edge]  {len(signals)} signals")
     return signals
 
-# ── Agent 4: spread-farmer (pure Python, no LLM — runs on tight loop) ────────
+# ── Agent 4: weather-edge (Open-Meteo free API, no LLM) ──────────────────────
+async def weather_edge_agent(markets: list[dict]) -> list[Signal]:
+    """
+    Fetches free weather forecasts from Open-Meteo (ECMWF + GFS ensemble),
+    computes model probability for temperature/precip thresholds,
+    then matches those signals to Polymarket weather markets.
+
+    Targets flat-terrain cities where models have genuine 10-12 day skill:
+    Dallas, Atlanta, Seoul, Shanghai, Phoenix, Kansas City.
+
+    No LLM needed. No API key needed. Pure model math vs crowd price.
+    """
+    if not WEATHER_AVAILABLE:
+        return []
+
+    try:
+        loop = asyncio.get_event_loop()
+        weather_signals = await loop.run_in_executor(None, get_weather_signals)
+    except Exception as e:
+        log.error(f"[weather-edge] forecast fetch error: {e}")
+        return []
+
+    # Filter to weather-related Polymarket markets
+    weather_markets = [
+        m for m in markets
+        if any(kw in m.get("question", "").lower()
+               for kw in ["weather", "temperature", "rain", "snow", "storm",
+                          "fahrenheit", "celsius", "high", "low", "freeze",
+                          "dallas", "atlanta", "phoenix", "seoul", "shanghai",
+                          "kansas city", "forecast"])
+    ]
+
+    if not weather_markets:
+        log.info("[weather-edge] 0 signals (no weather markets found in filtered set)")
+        return []
+
+    signals: list[Signal] = []
+
+    for ws in weather_signals:
+        # Only use signals inside the reliable forecast window
+        if not ws.is_within_edge_window:
+            continue
+        # Prefer in-season signals (higher model skill)
+        if not ws.in_season:
+            continue
+
+        for market in weather_markets:
+            result = match_weather_market(ws, market)
+            if result is None:
+                continue
+
+            outcome, current_price, fair_value, rationale = result
+            edge = abs(fair_value - current_price)
+
+            if edge < 0.06 or ws.confidence < MIN_CONFIDENCE:
+                continue
+
+            signals.append(Signal(
+                agent="weather-edge",
+                market_id=str(market.get("conditionId", market.get("id", ""))),
+                question=str(market.get("question", "")),
+                outcome=outcome,
+                current_price=current_price,
+                fair_value=fair_value,
+                confidence=ws.confidence,
+                rationale=f"[{ws.model_name} day+{ws.day_offset}] {rationale}",
+            ))
+
+    log.info(f"[weather-edge]  {len(signals)} signals "
+             f"({len(weather_signals)} model signals vs {len(weather_markets)} weather markets)")
+    return signals
+
+# ── Agent 5: spread-farmer (pure Python, no LLM — runs on tight loop) ────────
 def spread_farmer_agent(markets: list[dict]) -> list[Signal]:
     signals = []
     for m in markets:
@@ -628,12 +706,12 @@ async def llm_loop(bankroll_ref: list[float]):
                 if not markets:
                     log.warning("No markets fetched — skipping LLM cycle")
                 else:
-                    # Run all LLM + quant agents in parallel
-                    # crypto-edge uses Binance (free, no LLM) but runs concurrently
+                    # Run all agents in parallel — LLM agents + free data agents
                     results = await asyncio.gather(
                         news_edge_agent(session, markets),
                         arb_scanner_agent(session, markets),
                         crypto_edge_agent(markets),
+                        weather_edge_agent(markets),
                         return_exceptions=True,
                     )
 
@@ -711,7 +789,8 @@ async def main():
     log.info(f"  LLM loop  : every {LLM_LOOP_INTERVAL}s")
     log.info(f"  Spread lp : every {SPREAD_LOOP_INTERVAL}s")
     log.info(f"  Max Kelly : {MAX_KELLY_FRAC:.0%}")
-    log.info(f"  Binance   : {'enabled (crypto-edge agent active)' if BINANCE_AVAILABLE else 'disabled (pip install numpy pandas)'}")
+    log.info(f"  Binance   : {'enabled (crypto-edge active)' if BINANCE_AVAILABLE else 'disabled — pip install numpy pandas'}")
+    log.info(f"  Weather   : {'enabled (weather-edge active — Dallas/Atlanta/Seoul/Shanghai/Phoenix)' if WEATHER_AVAILABLE else 'disabled — check weather_edge.py'}")
     log.info("=" * 60)
 
     if not ANTHROPIC_API_KEY:
